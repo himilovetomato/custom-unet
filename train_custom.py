@@ -49,7 +49,8 @@ def main():
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
             img_scale=args.scale,
-            amp=args.amp
+            amp=args.amp,
+            mask_values=train_set.mask_values  # Add this line
         )
     except KeyboardInterrupt:
         torch.save(model.state_dict(), 'INTERRUPTED.pth')
