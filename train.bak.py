@@ -15,7 +15,6 @@ from tqdm import tqdm
 
 import wandb
 from evaluate import evaluate
-from evaluate import evaluate_and_visualize
 from unet import UNet
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
@@ -28,11 +27,10 @@ dir_checkpoint = Path('./checkpoints/')
 def train_model(
         model,
         device,
-        train_set,
-        val_set,
         epochs: int = 5,
         batch_size: int = 1,
         learning_rate: float = 1e-5,
+        val_percent: float = 0.1,
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
         amp: bool = False,
@@ -40,19 +38,27 @@ def train_model(
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
 ):
-    n_train = len(train_set)
-    n_val = len(val_set)
+    # 1. Create dataset
+    try:
+        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+    except (AssertionError, RuntimeError, IndexError):
+        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+
+    # 2. Split into train / validation partitions
+    n_val = int(len(dataset) * val_percent)
+    n_train = len(dataset) - n_val
+    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
     # 3. Create data loaders
     loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
-    # Initialize logging - remove val_percent from config
+    # (Initialize logging)
     experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
+             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
     )
 
     logging.info(f'''Starting training:
@@ -74,9 +80,6 @@ def train_model(
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
-
-    # Add evaluation interval
-    eval_interval = 5  # Evaluate every 5 epochs
 
     # 5. Begin training
     for epoch in range(1, epochs + 1):
@@ -156,16 +159,6 @@ def train_model(
                         except:
                             pass
 
-        # Evaluate periodically
-        if epoch % eval_interval == 0:
-            evaluate_and_visualize(
-                model=model,
-                dataloader=val_loader,
-                device=device,
-                epoch=epoch,
-                save_dir='eval_results'
-            )
-
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
@@ -182,7 +175,7 @@ def get_args():
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
-    parser.add_argument('--validation', '-v', type=float, dest='val', default=10.0,
+    parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
@@ -215,23 +208,10 @@ if __name__ == '__main__':
         model.load_state_dict(state_dict)
         logging.info(f'Model loaded from {args.load}')
 
-    # Create dataset
-    try:
-        dataset = CarvanaDataset(dir_img, dir_mask, args.scale)
-    except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, args.scale)
-
-    # Split into train / validation partitions
-    n_val = int(len(dataset) * args.val / 100)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
-
     model.to(device=device)
     try:
         train_model(
             model=model,
-            train_set=train_set,
-            val_set=val_set,
             epochs=args.epochs,
             batch_size=args.batch_size,
             learning_rate=args.lr,
@@ -248,8 +228,6 @@ if __name__ == '__main__':
         model.use_checkpointing()
         train_model(
             model=model,
-            train_set=train_set,
-            val_set=val_set,
             epochs=args.epochs,
             batch_size=args.batch_size,
             learning_rate=args.lr,
